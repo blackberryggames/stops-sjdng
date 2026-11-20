@@ -185,27 +185,42 @@ app.get("/stream", async (req, res) => {
   if (!videoStream) return res.status(404).json({ error: `No ${quality} stream found` });
   if (!audioStream) return res.status(404).json({ error: "No audio stream found" });
 
+  // Remove Transfer-Encoding — Node handles chunked automatically for piped responses
   res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Transfer-Encoding", "chunked");
+  res.setHeader("X-Content-Type-Options", "nosniff");
   Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
-  // ffmpeg: read video + audio URLs directly, mux to mp4, pipe stdout
+  // ffmpeg: copy both streams (no re-encoding = fast first byte), frag_keyframe for streaming
+  // -c:a copy works because itag 140 is already AAC in an m4a container
+  // drop 'faststart' — it only applies to files, not pipe output
   const ff = spawn("ffmpeg", [
+    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
     "-i", videoStream.url,
+    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
     "-i", audioStream.url,
     "-c:v", "copy",
-    "-c:a", "aac",
-    "-movflags", "frag_keyframe+empty_moov+faststart",
+    "-c:a", "copy",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
     "-f", "mp4",
     "pipe:1",
-  ], { stdio: ["ignore", "pipe", "ignore"] });
+  ], { stdio: ["ignore", "pipe", "pipe"] });
 
   ff.stdout.pipe(res);
 
+  // Log ffmpeg stderr for debugging
+  let ffmpegLog = "";
+  ff.stderr.on("data", (d) => {
+    ffmpegLog += d.toString();
+  });
+
+  ff.on("close", (code) => {
+    if (code !== 0) console.error(`ffmpeg exited ${code}:\n${ffmpegLog.slice(-1000)}`);
+  });
+
   req.on("close", () => ff.kill("SIGKILL"));
   ff.on("error", (err) => {
-    console.error("ffmpeg error:", err.message);
-    if (!res.headersSent) res.status(500).json({ error: "ffmpeg failed" });
+    console.error("ffmpeg spawn error:", err.message);
+    if (!res.headersSent) res.status(500).json({ error: "ffmpeg failed to start" });
   });
   ff.on("exit", (code) => {
     if (code !== 0 && code !== null) console.warn("ffmpeg exited with code", code);
