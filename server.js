@@ -169,6 +169,22 @@ const VIDEO_ITAGS_MUX = {
   "360p":  ["134", "243", "18"],
 };
 
+const STREAM_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://www.youtube.com/",
+  "Origin": "https://www.youtube.com",
+};
+
+// Download a YouTube stream URL to a local file, streamed to disk (no big RAM use).
+async function downloadStream(url, destPath) {
+  const res = await fetch(url, { headers: { ...STREAM_FETCH_HEADERS, Range: "bytes=0-" }, redirect: "follow" });
+  if (!res.ok && res.status !== 206) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`stream download ${res.status}: ${body.slice(0, 120)}`);
+  }
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
+}
+
 async function muxToFile(videoId, quality) {
   const key = `${videoId}_${quality}`;
   const filePath = path.join(CACHE_DIR, `${key}.mp4`);
@@ -191,39 +207,49 @@ async function muxToFile(videoId, quality) {
     if (!audioStream) throw new Error("No audio stream found");
 
     const tmpPath = filePath + ".part";
+    const videoTmp = path.join(CACHE_DIR, `${key}.v.tmp`);
+    const audioTmp = path.join(CACHE_DIR, `${key}.a.tmp`);
 
-    // Route ffmpeg's inputs through our own /proxy endpoint, which already
-    // fetches YouTube streams successfully (generic UA + Referer/Origin). Hitting
-    // the googlevideo URLs directly from ffmpeg gets a 403; the proxy doesn't.
-    const videoProxyUrl = `http://127.0.0.1:${PORT}/proxy?url=${encodeURIComponent(videoStream.url)}`;
-    const audioProxyUrl = `http://127.0.0.1:${PORT}/proxy?url=${encodeURIComponent(audioStream.url)}`;
+    // Download both streams to disk with node fetch (which works — proven by the
+    // probe). ffmpeg hitting googlevideo URLs directly gets 403s due to its HTTP
+    // signature/header handling, so we never let ffmpeg touch the network.
+    try {
+      await Promise.all([
+        downloadStream(videoStream.url, videoTmp),
+        downloadStream(audioStream.url, audioTmp),
+      ]);
 
-    await new Promise((resolve, reject) => {
-      const ff = spawn("ffmpeg", [
-        "-y",
-        "-i", videoProxyUrl,
-        "-i", audioProxyUrl,
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "128k",
-        // Regular (non-fragmented) mp4 with faststart → fully seekable file,
-        // moov atom moved to the front so Safari can read duration immediately.
-        "-movflags", "+faststart",
-        "-f", "mp4",
-        tmpPath,
-      ], { stdio: ["ignore", "ignore", "pipe"] });
+      // Mux the two local files → seekable mp4 (+faststart for Safari).
+      await new Promise((resolve, reject) => {
+        const ff = spawn("ffmpeg", [
+          "-y",
+          "-i", videoTmp,
+          "-i", audioTmp,
+          "-map", "0:v:0", "-map", "1:a:0",
+          "-c:v", "copy",
+          "-c:a", "aac", "-b:a", "128k",
+          "-movflags", "+faststart",
+          "-f", "mp4",
+          tmpPath,
+        ], { stdio: ["ignore", "ignore", "pipe"] });
 
-      let log = "";
-      ff.stderr.on("data", d => { log += d.toString(); });
-      ff.on("error", reject);
-      ff.on("close", code => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg exited ${code}: ${log.slice(-500)}`));
+        let log = "";
+        ff.stderr.on("data", d => { log += d.toString(); });
+        ff.on("error", reject);
+        ff.on("close", code => {
+          if (code === 0) resolve();
+          else reject(new Error(`ffmpeg exited ${code}: ${log.slice(-500)}`));
+        });
       });
-    });
 
-    fs.renameSync(tmpPath, filePath);
-    return filePath;
+      fs.renameSync(tmpPath, filePath);
+      return filePath;
+    } finally {
+      // Clean up the raw input files regardless of success
+      for (const f of [videoTmp, audioTmp]) {
+        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+      }
+    }
   })();
 
   inFlight.set(key, job);
