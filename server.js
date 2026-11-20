@@ -185,16 +185,24 @@ app.get("/stream", async (req, res) => {
   if (!videoStream) return res.status(404).json({ error: `No ${quality} stream found` });
   if (!audioStream) return res.status(404).json({ error: "No audio stream found" });
 
-  // Remove Transfer-Encoding — Node handles chunked automatically for piped responses
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("X-Content-Type-Options", "nosniff");
   Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
-  // ffmpeg: copy both streams (no re-encoding = fast first byte), frag_keyframe for streaming
-  // -c:a copy works because itag 140 is already AAC in an m4a container
-  // drop 'faststart' — it only applies to files, not pipe output
+  // Mobile browsers (Safari, Chrome on iOS/Android) send Range: bytes=0- before playing.
+  // We can't do real range seeking on a live pipe, but we MUST handle bytes=0- with 206
+  // or the browser refuses to play entirely.
+  const rangeHeader = req.headers["range"];
+  const isRangeFromZero = rangeHeader && /^bytes=0-/.test(rangeHeader);
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // Respond 206 for bytes=0- range requests (mobile requirement), 200 otherwise
+  if (isRangeFromZero) {
+    res.status(206);
+    res.setHeader("Content-Range", "bytes 0-*/*");
+  }
+
   const ff = spawn("ffmpeg", [
-    // Minimize startup buffering — output first fragment ASAP
     "-fflags", "+nobuffer+genpts",
     "-probesize", "32",
     "-analyzeduration", "0",
@@ -205,7 +213,7 @@ app.get("/stream", async (req, res) => {
     "-c:v", "copy",
     "-c:a", "copy",
     "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-    "-frag_duration", "1000000",   // 1-second fragments = browser gets data quickly
+    "-frag_duration", "1000000",
     "-f", "mp4",
     "pipe:1",
   ], { stdio: ["ignore", "pipe", "pipe"] });
