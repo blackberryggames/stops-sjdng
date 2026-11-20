@@ -190,13 +190,18 @@ async function muxToFile(videoId, quality) {
     if (!audioStream) throw new Error("No audio stream found");
 
     const tmpPath = filePath + ".part";
-    const UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+
+    // Route ffmpeg's inputs through our own /proxy endpoint, which already
+    // fetches YouTube streams successfully (generic UA + Referer/Origin). Hitting
+    // the googlevideo URLs directly from ffmpeg gets a 403; the proxy doesn't.
+    const videoProxyUrl = `http://127.0.0.1:${PORT}/proxy?url=${encodeURIComponent(videoStream.url)}`;
+    const audioProxyUrl = `http://127.0.0.1:${PORT}/proxy?url=${encodeURIComponent(audioStream.url)}`;
 
     await new Promise((resolve, reject) => {
       const ff = spawn("ffmpeg", [
         "-y",
-        "-user_agent", UA, "-i", videoStream.url,
-        "-user_agent", UA, "-i", audioStream.url,
+        "-i", videoProxyUrl,
+        "-i", audioProxyUrl,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
