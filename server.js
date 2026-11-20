@@ -6,9 +6,17 @@ import express from "express";
 import { pipeline } from "stream/promises";
 import { Readable } from "stream";
 import { spawn } from "child_process";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// Cache dir for muxed files + in-flight mux tracking
+const CACHE_DIR = path.join(os.tmpdir(), "yt-mux");
+fs.mkdirSync(CACHE_DIR, { recursive: true });
+const inFlight = new Map(); // key -> Promise<string filePath>
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -149,7 +157,79 @@ app.get("/proxy", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /stream?v=VIDEO_ID&q=720p  — mux video+audio with ffmpeg, pipe as mp4
+// Mux video+audio to a cached temp file (returns path). iOS/iPad Safari will
+// NOT play a live pipe — it needs a seekable file with a real Content-Length
+// and byte-range support. So we mux to disk once, cache it, then range-serve.
+// ---------------------------------------------------------------------------
+const AUDIO_ITAGS = ["140", "251", "250", "249"];
+const VIDEO_ITAGS_MUX = {
+  "1080p": ["137", "248", "299", "303"],
+  "720p":  ["136", "247", "298", "302"],
+  "360p":  ["134", "243", "18"],
+};
+
+async function muxToFile(videoId, quality) {
+  const key = `${videoId}_${quality}`;
+  const filePath = path.join(CACHE_DIR, `${key}.mp4`);
+
+  // Already cached and non-empty → reuse
+  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) return filePath;
+  // Already being muxed → wait for that one
+  if (inFlight.has(key)) return inFlight.get(key);
+
+  const job = (async () => {
+    const playerData = await fetchPlayerData(videoId);
+    const all = [
+      ...(playerData?.streamingData?.formats || []),
+      ...(playerData?.streamingData?.adaptiveFormats || []),
+    ];
+    const itags = VIDEO_ITAGS_MUX[quality] || VIDEO_ITAGS_MUX["720p"];
+    const videoStream = all.find(f => itags.includes(String(f.itag)) && f.url);
+    const audioStream = all.find(f => AUDIO_ITAGS.includes(String(f.itag)) && f.url);
+    if (!videoStream) throw new Error(`No ${quality} video stream found`);
+    if (!audioStream) throw new Error("No audio stream found");
+
+    const tmpPath = filePath + ".part";
+    const UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-user_agent", UA, "-i", videoStream.url,
+        "-user_agent", UA, "-i", audioStream.url,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        // Regular (non-fragmented) mp4 with faststart → fully seekable file,
+        // moov atom moved to the front so Safari can read duration immediately.
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        tmpPath,
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+
+      let log = "";
+      ff.stderr.on("data", d => { log += d.toString(); });
+      ff.on("error", reject);
+      ff.on("close", code => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg exited ${code}: ${log.slice(-500)}`));
+      });
+    });
+
+    fs.renameSync(tmpPath, filePath);
+    return filePath;
+  })();
+
+  inFlight.set(key, job);
+  try {
+    return await job;
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /stream?v=VIDEO_ID&q=720p — mux to cached file, serve with range support
 // ---------------------------------------------------------------------------
 app.get("/stream", async (req, res) => {
   const videoId = req.query.v;
@@ -158,81 +238,76 @@ app.get("/stream", async (req, res) => {
     return res.status(400).json({ error: "Missing or invalid video ID" });
   }
 
-  // Audio itags: 140 = m4a 128k (best for mp4 container), 251 = opus webm
-  const AUDIO_ITAGS = ["140", "251", "250", "249"];
-  const VIDEO_ITAGS = {
-    "1080p": ["137", "248", "299", "303"],
-    "720p":  ["136", "247", "298", "302"],
-    "360p":  ["134", "243", "18"],
-  };
-
-  let playerData;
+  let filePath;
   try {
-    playerData = await fetchPlayerData(videoId);
+    filePath = await muxToFile(videoId, quality);
   } catch (err) {
-    return res.status(502).json({ error: err.message });
+    console.error("mux error:", err.message);
+    if (!res.headersSent) return res.status(502).json({ error: err.message });
+    return;
   }
 
-  const all = [
-    ...(playerData?.streamingData?.formats || []),
-    ...(playerData?.streamingData?.adaptiveFormats || []),
-  ];
-
-  const itags = VIDEO_ITAGS[quality] || VIDEO_ITAGS["720p"];
-  const videoStream = all.find(f => itags.includes(String(f.itag)) && f.url);
-  const audioStream = all.find(f => AUDIO_ITAGS.includes(String(f.itag)) && f.url);
-
-  if (!videoStream) return res.status(404).json({ error: `No ${quality} stream found` });
-  if (!audioStream) return res.status(404).json({ error: "No audio stream found" });
+  const stat = fs.statSync(filePath);
+  const total = stat.size;
 
   Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
-
-  // Mobile browsers (Safari, Chrome on iOS/Android) send Range: bytes=0- before playing.
-  // We can't do real range seeking on a live pipe, but we MUST handle bytes=0- with 206
-  // or the browser refuses to play entirely.
-  const rangeHeader = req.headers["range"];
-  const isRangeFromZero = rangeHeader && /^bytes=0-/.test(rangeHeader);
-
   res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "public, max-age=3600");
 
-  const ff = spawn("ffmpeg", [
-    "-fflags", "+nobuffer+genpts",
-    "-probesize", "32",
-    "-analyzeduration", "0",
-    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
-    "-i", videoStream.url,
-    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
-    "-i", audioStream.url,
-    "-c:v", "copy",
-    "-c:a", "aac",        // re-encode audio — ensures clean AAC in mp4 container
-    "-b:a", "128k",
-    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-    "-frag_duration", "1000000",
-    "-f", "mp4",
-    "pipe:1",
-  ], { stdio: ["ignore", "pipe", "pipe"] });
+  const range = req.headers["range"];
+  if (range) {
+    // Parse "bytes=START-END"
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : total - 1;
+    if (isNaN(start) || start < 0) start = 0;
+    if (isNaN(end) || end >= total) end = total - 1;
+    if (start > end) { start = 0; end = total - 1; }
 
-  ff.stdout.pipe(res);
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+    res.setHeader("Content-Length", end - start + 1);
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.status(200);
+    res.setHeader("Content-Length", total);
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
 
-  // Log ffmpeg stderr for debugging
-  let ffmpegLog = "";
-  ff.stderr.on("data", (d) => {
-    ffmpegLog += d.toString();
-  });
+// ---------------------------------------------------------------------------
+// GET /prepare?v=VIDEO_ID&q=720p — kick off mux, report readiness (for polling)
+// ---------------------------------------------------------------------------
+const muxErrors = new Map(); // key -> error message
 
-  ff.on("close", (code) => {
-    if (code !== 0) console.error(`ffmpeg exited ${code}:\n${ffmpegLog.slice(-1000)}`);
-  });
+app.get("/prepare", (req, res) => {
+  const videoId = req.query.v;
+  const quality = req.query.q || "720p";
+  if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    return res.status(400).json({ error: "Missing or invalid video ID" });
+  }
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
 
-  req.on("close", () => ff.kill("SIGKILL"));
-  ff.on("error", (err) => {
-    console.error("ffmpeg spawn error:", err.message);
-    if (!res.headersSent) res.status(500).json({ error: "ffmpeg failed to start" });
-  });
-  ff.on("exit", (code) => {
-    if (code !== 0 && code !== null) console.warn("ffmpeg exited with code", code);
-  });
+  const key = `${videoId}_${quality}`;
+  const filePath = path.join(CACHE_DIR, `${key}.mp4`);
+
+  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+    return res.json({ ready: true });
+  }
+  if (muxErrors.has(key)) {
+    const msg = muxErrors.get(key);
+    muxErrors.delete(key);
+    return res.status(502).json({ ready: false, error: msg });
+  }
+  // Start mux if not already running (fire-and-forget; dedup via inFlight)
+  if (!inFlight.has(key)) {
+    muxToFile(videoId, quality).catch(e => {
+      console.error("prepare mux:", e.message);
+      muxErrors.set(key, e.message);
+    });
+  }
+  res.json({ ready: false });
 });
 
 // ---------------------------------------------------------------------------
