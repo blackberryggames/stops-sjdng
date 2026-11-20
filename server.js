@@ -341,25 +341,48 @@ app.get("/streamdebug", async (req, res) => {
   if (!videoStream) return res.status(404).json({ error: `No ${quality} stream`, available: all.map(f => ({itag: f.itag, q: f.qualityLabel, mime: f.mimeType})) });
   if (!audioStream) return res.status(404).json({ error: "No audio stream" });
 
+  // Probe the stream URLs with different UA / Range combos to find what YouTube accepts.
+  const ANDROID_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+  const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  const combos = [
+    { name: "generic UA, no range",   ua: "Mozilla/5.0 (compatible; FlyProxy/1.0)", range: null },
+    { name: "generic UA, range 0-",   ua: "Mozilla/5.0 (compatible; FlyProxy/1.0)", range: "bytes=0-" },
+    { name: "chrome UA, range 0-",    ua: CHROME_UA, range: "bytes=0-" },
+    { name: "android UA, no range",   ua: ANDROID_UA, range: null },
+    { name: "android UA, range 0-",   ua: ANDROID_UA, range: "bytes=0-" },
+  ];
+
+  async function probe(url) {
+    const out = [];
+    for (const c of combos) {
+      const headers = { "User-Agent": c.ua, "Referer": "https://www.youtube.com/", "Origin": "https://www.youtube.com" };
+      if (c.range) headers["Range"] = c.range;
+      try {
+        const r = await fetch(url, { headers, redirect: "follow" });
+        let snippet = "";
+        if (!r.ok) snippet = (await r.text().catch(() => "")).slice(0, 120).replace(/\s+/g, " ");
+        out.push(`  [${r.status}] ${c.name}${snippet ? " — " + snippet : ""}`);
+        // Drain body on success to free the connection
+        if (r.ok && r.body) r.body.cancel?.();
+      } catch (e) {
+        out.push(`  [ERR] ${c.name} — ${e.message}`);
+      }
+    }
+    return out.join("\n");
+  }
+
   res.setHeader("Content-Type", "text/plain");
-  res.write(`video itag=${videoStream.itag} mime=${videoStream.mimeType}\naudio itag=${audioStream.itag} mime=${audioStream.mimeType}\n\nffmpeg stderr:\n`);
-
-  const ff = spawn("ffmpeg", [
-    "-fflags", "+nobuffer+genpts", "-probesize", "32", "-analyzeduration", "0",
-    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
-    "-i", videoStream.url,
-    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
-    "-i", audioStream.url,
-    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-    "-t", "5",   // only 5 seconds
-    "-f", "mp4", "pipe:1",
-  ], { stdio: ["ignore", "pipe", "pipe"] });
-
-  ff.stdout.on("data", d => res.write(`[stdout ${d.length} bytes]\n`));
-  ff.stderr.on("data", d => res.write(d.toString()));
-  ff.on("close", code => { res.write(`\n--- exit code: ${code} ---\n`); res.end(); });
-  req.on("close", () => ff.kill("SIGKILL"));
+  const lines = [];
+  lines.push(`video itag=${videoStream.itag} mime=${videoStream.mimeType}`);
+  lines.push(`audio itag=${audioStream.itag} mime=${audioStream.mimeType}`);
+  lines.push(`playabilityStatus=${playerData?.playabilityStatus?.status}`);
+  lines.push("");
+  lines.push("VIDEO stream probes:");
+  lines.push(await probe(videoStream.url));
+  lines.push("");
+  lines.push("AUDIO stream probes:");
+  lines.push(await probe(audioStream.url));
+  res.send(lines.join("\n"));
 });
 
 // ---------------------------------------------------------------------------
