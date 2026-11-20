@@ -451,6 +451,12 @@ async function fetchPlayerData(videoId) {
   const API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
   const endpoint = `https://www.youtube.com/youtubei/v1/player?key=${API_KEY}&prettyPrint=false`;
 
+  // "android_sdkless" client — the ANDROID client WITHOUT androidSdkVersion.
+  // The androidSdkVersion field is what triggers YouTube's PO Token requirement,
+  // which makes adaptive (720p/1080p/audio) stream URLs return 403 while the
+  // progressive 360p (itag 18) still works. Dropping it = no PO token needed.
+  // Config copied from yt-dlp's _base.py android_sdkless client.
+  const ANDROID_SDKLESS_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip";
   const body = {
     videoId,
     contentCheckOk: true,
@@ -459,7 +465,8 @@ async function fetchPlayerData(videoId) {
       client: {
         clientName: "ANDROID",
         clientVersion: "20.10.38",
-        androidSdkVersion: 34,
+        // NO androidSdkVersion — intentionally omitted
+        userAgent: ANDROID_SDKLESS_UA,
         hl: "en",
         gl: "US",
       },
@@ -470,7 +477,7 @@ async function fetchPlayerData(videoId) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+      "User-Agent": ANDROID_SDKLESS_UA,
       "X-YouTube-Client-Name": "3",
       "X-YouTube-Client-Version": "20.10.38",
     },
