@@ -26,9 +26,12 @@ const CORS_HEADERS = {
 };
 
 const QUALITY_ITAGS = {
-  "1080p": ["137", "248", "299", "303"],
-  "720p":  ["136", "247", "298", "302"],
-  "360p":  ["134", "243", "18"],
+  // Progressive itags (18, 22) are listed FIRST — they include audio and play
+  // directly in any browser (incl. iPad Safari) without muxing. Adaptive itags
+  // are fallbacks (video-only, need server-side mux which YouTube may 403).
+  "1080p": ["137", "248", "299", "303"],        // no progressive 1080p exists
+  "720p":  ["22", "136", "247", "298", "302"],  // itag 22 = progressive 720p w/ audio
+  "360p":  ["18", "134", "243"],                // itag 18 = progressive 360p w/ audio
 };
 
 // Apply CORS to every response
@@ -71,17 +74,35 @@ app.get("/formats", async (req, res) => {
   if (!videoId) return res.status(400).json({ error: "Missing video ID" });
   try {
     const playerData = await fetchPlayerData(videoId);
-    const formats = [
-      ...(playerData?.streamingData?.formats || []),
-      ...(playerData?.streamingData?.adaptiveFormats || []),
-    ].map(f => ({
+    const progressive = playerData?.streamingData?.formats || [];     // have audio
+    const adaptive = playerData?.streamingData?.adaptiveFormats || []; // video-only or audio-only
+    const progItags = new Set(progressive.map(f => String(f.itag)));
+
+    const describe = f => ({
       itag: f.itag,
-      mimeType: f.mimeType,
-      quality: f.quality,
-      qualityLabel: f.qualityLabel,
+      mimeType: (f.mimeType || "").split(";")[0],
+      qualityLabel: f.qualityLabel || f.quality,
+      progressive: progItags.has(String(f.itag)),  // true = has audio, plays directly
+      hasAudio: progItags.has(String(f.itag)) || (f.mimeType || "").startsWith("audio"),
       hasUrl: !!f.url,
-    }));
-    res.json({ formats });
+    });
+
+    // Quick-test downloadability of each format that has a direct url (first ~200KB)
+    const want = req.query.test === "1";
+    const all = [...progressive, ...adaptive];
+    const rows = [];
+    for (const f of all) {
+      const d = describe(f);
+      if (want && f.url) {
+        try {
+          const r = await fetch(f.url, { headers: STREAM_FETCH_HEADERS, redirect: "follow" });
+          d.status = r.status;
+          r.body?.cancel?.();
+        } catch (e) { d.status = "ERR:" + e.message; }
+      }
+      rows.push(d);
+    }
+    res.json({ progressiveCount: progressive.length, adaptiveCount: adaptive.length, formats: rows });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -496,20 +517,28 @@ async function fetchPlayerData(videoId) {
 // ---------------------------------------------------------------------------
 function extractStreams(playerData, req) {
   const base = `${req.protocol}://${req.get("host")}`;
-  const all = [
-    ...(playerData?.streamingData?.formats || []),
-    ...(playerData?.streamingData?.adaptiveFormats || []),
-  ];
+  const progressive = playerData?.streamingData?.formats || [];     // have audio
+  const adaptive = playerData?.streamingData?.adaptiveFormats || [];
+  const all = [...progressive, ...adaptive];
+  const progItags = new Set(progressive.map(f => String(f.itag)));
+
   const streams = {};
   for (const [quality, itags] of Object.entries(QUALITY_ITAGS)) {
-    const match = all.find(f => itags.includes(String(f.itag)) && f.url);
+    // Pick by itag PRIORITY order (progressive itags listed first), not array order
+    let match = null;
+    for (const itag of itags) {
+      match = all.find(f => String(f.itag) === itag && f.url);
+      if (match) break;
+    }
     if (match) {
+      const hasAudio = progItags.has(String(match.itag));
       streams[quality] = {
         proxyUrl: `${base}/proxy?url=${encodeURIComponent(match.url)}`,
         directUrl: match.url,
         mimeType: match.mimeType || "video/mp4",
         itag: match.itag,
         qualityLabel: match.qualityLabel || quality,
+        hasAudio,  // true = plays directly with sound; false = adaptive (needs mux)
       };
     }
   }
