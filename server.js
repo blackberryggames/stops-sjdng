@@ -194,13 +194,7 @@ app.get("/stream", async (req, res) => {
   const isRangeFromZero = rangeHeader && /^bytes=0-/.test(rangeHeader);
 
   res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("X-Content-Type-Options", "nosniff");
-  // Respond 206 for bytes=0- range requests (mobile requirement), 200 otherwise
-  if (isRangeFromZero) {
-    res.status(206);
-    res.setHeader("Content-Range", "bytes 0-*/*");
-  }
 
   const ff = spawn("ffmpeg", [
     "-fflags", "+nobuffer+genpts",
@@ -211,7 +205,8 @@ app.get("/stream", async (req, res) => {
     "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
     "-i", audioStream.url,
     "-c:v", "copy",
-    "-c:a", "copy",
+    "-c:a", "aac",        // re-encode audio — ensures clean AAC in mp4 container
+    "-b:a", "128k",
     "-movflags", "frag_keyframe+empty_moov+default_base_moof",
     "-frag_duration", "1000000",
     "-f", "mp4",
@@ -238,6 +233,53 @@ app.get("/stream", async (req, res) => {
   ff.on("exit", (code) => {
     if (code !== 0 && code !== null) console.warn("ffmpeg exited with code", code);
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /streamdebug?v=VIDEO_ID&q=720p — run ffmpeg, return stderr instead of video
+// ---------------------------------------------------------------------------
+app.get("/streamdebug", async (req, res) => {
+  const videoId = req.query.v;
+  const quality = req.query.q || "720p";
+  if (!videoId) return res.status(400).json({ error: "Missing video ID" });
+
+  const AUDIO_ITAGS = ["140", "251", "250", "249"];
+  const VIDEO_ITAGS = {
+    "1080p": ["137", "248", "299", "303"],
+    "720p":  ["136", "247", "298", "302"],
+    "360p":  ["134", "243", "18"],
+  };
+
+  let playerData;
+  try { playerData = await fetchPlayerData(videoId); }
+  catch (err) { return res.status(502).json({ error: err.message }); }
+
+  const all = [...(playerData?.streamingData?.formats || []), ...(playerData?.streamingData?.adaptiveFormats || [])];
+  const videoStream = all.find(f => (VIDEO_ITAGS[quality] || VIDEO_ITAGS["720p"]).includes(String(f.itag)) && f.url);
+  const audioStream = all.find(f => AUDIO_ITAGS.includes(String(f.itag)) && f.url);
+
+  if (!videoStream) return res.status(404).json({ error: `No ${quality} stream`, available: all.map(f => ({itag: f.itag, q: f.qualityLabel, mime: f.mimeType})) });
+  if (!audioStream) return res.status(404).json({ error: "No audio stream" });
+
+  res.setHeader("Content-Type", "text/plain");
+  res.write(`video itag=${videoStream.itag} mime=${videoStream.mimeType}\naudio itag=${audioStream.itag} mime=${audioStream.mimeType}\n\nffmpeg stderr:\n`);
+
+  const ff = spawn("ffmpeg", [
+    "-fflags", "+nobuffer+genpts", "-probesize", "32", "-analyzeduration", "0",
+    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+    "-i", videoStream.url,
+    "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+    "-i", audioStream.url,
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    "-t", "5",   // only 5 seconds
+    "-f", "mp4", "pipe:1",
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+
+  ff.stdout.on("data", d => res.write(`[stdout ${d.length} bytes]\n`));
+  ff.stderr.on("data", d => res.write(d.toString()));
+  ff.on("close", code => { res.write(`\n--- exit code: ${code} ---\n`); res.end(); });
+  req.on("close", () => ff.kill("SIGKILL"));
 });
 
 // ---------------------------------------------------------------------------
