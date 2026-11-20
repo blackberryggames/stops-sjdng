@@ -170,17 +170,19 @@ const VIDEO_ITAGS_MUX = {
 };
 
 const STREAM_FETCH_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (compatible; FlyProxy/1.0)",
   "Referer": "https://www.youtube.com/",
   "Origin": "https://www.youtube.com",
 };
 
 // Download a YouTube stream URL to a local file, streamed to disk (no big RAM use).
+// No Range header (plain GET returned 200 in the probe) and no extra options that
+// might trip abuse detection.
 async function downloadStream(url, destPath) {
-  const res = await fetch(url, { headers: { ...STREAM_FETCH_HEADERS, Range: "bytes=0-" }, redirect: "follow" });
-  if (!res.ok && res.status !== 206) {
+  const res = await fetch(url, { headers: STREAM_FETCH_HEADERS, redirect: "follow" });
+  if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`stream download ${res.status}: ${body.slice(0, 120)}`);
+    throw new Error(`stream download ${res.status}: ${body.slice(0, 160)}`);
   }
   await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
 }
@@ -214,10 +216,10 @@ async function muxToFile(videoId, quality) {
     // probe). ffmpeg hitting googlevideo URLs directly gets 403s due to its HTTP
     // signature/header handling, so we never let ffmpeg touch the network.
     try {
-      await Promise.all([
-        downloadStream(videoStream.url, videoTmp),
-        downloadStream(audioStream.url, audioTmp),
-      ]);
+      // Sequential, not parallel — two simultaneous googlevideo connections from
+      // the same IP can trip abuse detection and 403.
+      await downloadStream(videoStream.url, videoTmp);
+      await downloadStream(audioStream.url, audioTmp);
 
       // Mux the two local files → seekable mp4 (+faststart for Safari).
       await new Promise((resolve, reject) => {
@@ -398,6 +400,30 @@ app.get("/streamdebug", async (req, res) => {
     return out.join("\n");
   }
 
+  // Real download test — exactly what muxToFile does, to see if a full download
+  // diverges from the lightweight probe.
+  async function realDownloadTest(url) {
+    try {
+      const r = await fetch(url, { headers: STREAM_FETCH_HEADERS, redirect: "follow" });
+      if (!r.ok) {
+        const body = (await r.text().catch(() => "")).slice(0, 160).replace(/\s+/g, " ");
+        return `  [${r.status}] full download FAILED — ${body}`;
+      }
+      // Read a few chunks to confirm bytes actually flow
+      let bytes = 0;
+      const reader = r.body.getReader();
+      while (bytes < 1_000_000) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+      }
+      reader.cancel?.();
+      return `  [${r.status}] full download OK — read ${bytes} bytes`;
+    } catch (e) {
+      return `  [ERR] full download — ${e.message}`;
+    }
+  }
+
   res.setHeader("Content-Type", "text/plain");
   const lines = [];
   lines.push(`video itag=${videoStream.itag} mime=${videoStream.mimeType}`);
@@ -407,8 +433,14 @@ app.get("/streamdebug", async (req, res) => {
   lines.push("VIDEO stream probes:");
   lines.push(await probe(videoStream.url));
   lines.push("");
+  lines.push("VIDEO real download:");
+  lines.push(await realDownloadTest(videoStream.url));
+  lines.push("");
   lines.push("AUDIO stream probes:");
   lines.push(await probe(audioStream.url));
+  lines.push("");
+  lines.push("AUDIO real download:");
+  lines.push(await realDownloadTest(audioStream.url));
   res.send(lines.join("\n"));
 });
 
