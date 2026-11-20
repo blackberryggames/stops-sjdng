@@ -5,6 +5,7 @@
 import express from "express";
 import { pipeline } from "stream/promises";
 import { Readable } from "stream";
+import { spawn } from "child_process";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -145,6 +146,70 @@ app.get("/proxy", async (req, res) => {
   } catch (err) {
     if (!res.headersSent) res.status(502).json({ error: `Upstream fetch failed: ${err.message}` });
   }
+});
+
+// ---------------------------------------------------------------------------
+// GET /stream?v=VIDEO_ID&q=720p  — mux video+audio with ffmpeg, pipe as mp4
+// ---------------------------------------------------------------------------
+app.get("/stream", async (req, res) => {
+  const videoId = req.query.v;
+  const quality = req.query.q || "720p";
+  if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    return res.status(400).json({ error: "Missing or invalid video ID" });
+  }
+
+  // Audio itags: 140 = m4a 128k (best for mp4 container), 251 = opus webm
+  const AUDIO_ITAGS = ["140", "251", "250", "249"];
+  const VIDEO_ITAGS = {
+    "1080p": ["137", "248", "299", "303"],
+    "720p":  ["136", "247", "298", "302"],
+    "360p":  ["134", "243", "18"],
+  };
+
+  let playerData;
+  try {
+    playerData = await fetchPlayerData(videoId);
+  } catch (err) {
+    return res.status(502).json({ error: err.message });
+  }
+
+  const all = [
+    ...(playerData?.streamingData?.formats || []),
+    ...(playerData?.streamingData?.adaptiveFormats || []),
+  ];
+
+  const itags = VIDEO_ITAGS[quality] || VIDEO_ITAGS["720p"];
+  const videoStream = all.find(f => itags.includes(String(f.itag)) && f.url);
+  const audioStream = all.find(f => AUDIO_ITAGS.includes(String(f.itag)) && f.url);
+
+  if (!videoStream) return res.status(404).json({ error: `No ${quality} stream found` });
+  if (!audioStream) return res.status(404).json({ error: "No audio stream found" });
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Transfer-Encoding", "chunked");
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+
+  // ffmpeg: read video + audio URLs directly, mux to mp4, pipe stdout
+  const ff = spawn("ffmpeg", [
+    "-i", videoStream.url,
+    "-i", audioStream.url,
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-movflags", "frag_keyframe+empty_moov+faststart",
+    "-f", "mp4",
+    "pipe:1",
+  ], { stdio: ["ignore", "pipe", "ignore"] });
+
+  ff.stdout.pipe(res);
+
+  req.on("close", () => ff.kill("SIGKILL"));
+  ff.on("error", (err) => {
+    console.error("ffmpeg error:", err.message);
+    if (!res.headersSent) res.status(500).json({ error: "ffmpeg failed" });
+  });
+  ff.on("exit", (code) => {
+    if (code !== 0 && code !== null) console.warn("ffmpeg exited with code", code);
+  });
 });
 
 // ---------------------------------------------------------------------------
