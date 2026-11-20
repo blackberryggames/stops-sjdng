@@ -194,6 +194,10 @@ app.get("/stream", async (req, res) => {
   // -c:a copy works because itag 140 is already AAC in an m4a container
   // drop 'faststart' — it only applies to files, not pipe output
   const ff = spawn("ffmpeg", [
+    // Minimize startup buffering — output first fragment ASAP
+    "-fflags", "+nobuffer+genpts",
+    "-probesize", "32",
+    "-analyzeduration", "0",
     "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
     "-i", videoStream.url,
     "-user_agent", "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
@@ -201,6 +205,7 @@ app.get("/stream", async (req, res) => {
     "-c:v", "copy",
     "-c:a", "copy",
     "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    "-frag_duration", "1000000",   // 1-second fragments = browser gets data quickly
     "-f", "mp4",
     "pipe:1",
   ], { stdio: ["ignore", "pipe", "pipe"] });
