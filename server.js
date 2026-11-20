@@ -113,12 +113,13 @@ app.get("/raw", async (req, res) => {
 // GET /proxy?url=ENCODED_URL — streams video bytes
 // ---------------------------------------------------------------------------
 app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).json({ error: "Missing url param" });
+  // Express already percent-decodes query params once. Do NOT decode again —
+  // a second decodeURIComponent corrupts the YouTube signature (%2C→',', %3D→'=')
+  // which makes googlevideo return 403.
+  const decoded = req.query.url;
+  if (!decoded) return res.status(400).json({ error: "Missing url param" });
 
-  let decoded;
   try {
-    decoded = decodeURIComponent(target);
     new URL(decoded);
   } catch {
     return res.status(400).json({ error: "Invalid URL" });
